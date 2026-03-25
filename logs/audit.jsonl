@@ -1,0 +1,2 @@
+{"event": "ACCESS_GRANTED", "user_id": "test@demo.com", "question": "¿Total ventas?", "file_path": "data/ventas_test.xlsx", "action": "query", "role": "analyst", "sensitive": false, "timestamp": "2026-03-25T02:18:26.915892+00:00"}
+{"event": "ACCESS_GRANTED", "user_id": "test@demo.com", "question": "¿Total ventas?", "file_path": "data/ventas_test.xlsx", "action": "query", "role": "analyst", "sensitive": false, "timestamp": "2026-03-25T02:39:46.378577+00:00"}
