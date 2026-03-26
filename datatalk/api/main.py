@@ -1,35 +1,29 @@
 """
 API FastAPI — DataTalk
-Endpoints: /health, /upload, /query, /approve, /history, /audit, /auth
+Endpoints: /health, /upload, /query, /approve, /history, /api/messages (Teams Bot)
 """
 
 import os
 import uuid
 import shutil
-import logging
 import json
 from pathlib import Path
-
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
-load_dotenv()
+# Bot Framework
+from botbuilder.core import BotFrameworkAdapterSettings, BotFrameworkAdapter, TurnContext
+from botbuilder.schema import Activity
 
 from datatalk.agents import orchestrator, guard_agent, schema_agent, query_agent
+from datatalk.bot.teams_bot import DataTalkBot
 
-logger = logging.getLogger(__name__)
+load_dotenv()
 
-# ---------------------------------------------------------------------------
-# App
-# ---------------------------------------------------------------------------
-
-app = FastAPI(
-    title="DataTalk API",
-    version="1.0.0",
-    description="Agente Text-to-SQL con validación y audit log",
-)
+app = FastAPI(title="DataTalk API", version="1.0.0",
+              description="Agente Text-to-SQL con validación y audit log")
 
 app.add_middleware(
     CORSMiddleware,
@@ -39,24 +33,30 @@ app.add_middleware(
     allow_credentials=True,
 )
 
-# ---------------------------------------------------------------------------
-# Routers — DESPUÉS de crear app
-# ---------------------------------------------------------------------------
+# ── Bot Framework Adapter ──────────────────────────────────────────────────
+_bot_settings = BotFrameworkAdapterSettings(
+    app_id=os.environ.get("MICROSOFT_APP_ID", ""),
+    app_password=os.environ.get("MICROSOFT_APP_PASSWORD", ""),
+)
+_bot_settings.channel_auth_tenant = os.environ.get("AZURE_TENANT_ID", "")
 
-from datatalk.api.routes.audit_viewer import router as audit_router
-from datatalk.api.routes.auth import router as auth_router
+_adapter = BotFrameworkAdapter(_bot_settings)
+_bot = DataTalkBot()
 
-app.include_router(audit_router, prefix="/audit", tags=["Audit"])
-app.include_router(auth_router,  prefix="/auth",  tags=["Auth"])
 
-# ---------------------------------------------------------------------------
-# Estado en memoria
-# ---------------------------------------------------------------------------
+async def _on_error(context: TurnContext, error: Exception):
+    print(f"[Bot Error] {error}")
+    await context.send_activity("⚠️ Ocurrió un error inesperado. Intentá de nuevo.")
 
+
+_adapter.on_turn_error = _on_error
+
+# Consultas pendientes de aprobación (en memoria)
 _pending: dict = {}
 
 UPLOADS_DIR = Path("uploads")
 UPLOADS_DIR.mkdir(exist_ok=True)
+
 
 # ---------------------------------------------------------------------------
 # Modelos
@@ -77,23 +77,46 @@ class ApproveRequest(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Endpoints
+# Endpoint Bot Framework — Teams envía todos los mensajes acá
 # ---------------------------------------------------------------------------
 
-@app.get("/health", tags=["Sistema"])
+@app.post("/api/messages")
+async def messages(request: Request):
+    """
+    Endpoint principal del bot de Teams.
+    Bot Framework autentica el request y lo rutea al DataTalkBot.
+    """
+    if "application/json" not in request.headers.get("Content-Type", ""):
+        raise HTTPException(415, "Unsupported Media Type")
+
+    body = await request.json()
+    activity = Activity().deserialize(body)
+    auth_header = request.headers.get("Authorization", "")
+
+    response = Response()
+
+    async def aux_func(turn_context: TurnContext):
+        await _bot.on_turn(turn_context)
+
+    try:
+        await _adapter.process_activity(activity, auth_header, aux_func)
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+    return Response(status_code=200)
+
+
+# ---------------------------------------------------------------------------
+# Endpoints REST originales
+# ---------------------------------------------------------------------------
+
+@app.get("/health")
 def health():
     return {"status": "ok", "service": "DataTalk API", "version": "1.0.0"}
 
 
-@app.post("/upload", tags=["Datos"])
+@app.post("/upload")
 async def upload(file: UploadFile = File(...), user_id: str = "demo_user"):
-    """
-    Sube un archivo Excel/CSV.
-    1. Guard: valida acceso
-    2. Guarda en uploads/ local
-    3. Sube a Azure Blob Storage (si está configurado)
-    4. Retorna schema detectado
-    """
     allowed_ext = {".xlsx", ".xls", ".csv", ".tsv"}
     ext = Path(file.filename).suffix.lower()
     if ext not in allowed_ext:
@@ -115,19 +138,8 @@ async def upload(file: UploadFile = File(...), user_id: str = "demo_user"):
     except Exception as e:
         raise HTTPException(422, f"Error leyendo el archivo: {str(e)}")
 
-    # Blob Storage (opcional)
-    blob_url = None
-    try:
-        from datatalk.data.blob_storage import blob_available, upload_file as blob_upload
-        if blob_available():
-            blob_url = blob_upload(str(file_path))
-    except Exception as e:
-        logger.warning(f"Blob upload falló (no crítico): {e}")
-
     return {
         "file_path": str(file_path),
-        "blob_url": blob_url,
-        "storage": "azure_blob" if blob_url else "local",
         "table_name": schema["table_name"],
         "row_count": schema["row_count"],
         "columns": schema["columns"],
@@ -136,12 +148,8 @@ async def upload(file: UploadFile = File(...), user_id: str = "demo_user"):
     }
 
 
-@app.post("/query", tags=["Consultas"])
+@app.post("/query")
 def query(req: QueryRequest):
-    """
-    Recibe pregunta → Guard → clasifica intención → genera SQL.
-    Devuelve el SQL para aprobación del usuario (human-in-the-loop).
-    """
     guard = guard_agent.validate_and_log(
         user_id=req.user_id, question=req.question, file_path=req.file_path
     )
@@ -157,31 +165,27 @@ def query(req: QueryRequest):
 
     query_id = str(uuid.uuid4())
     _pending[query_id] = {
-        "question":      req.question,
-        "file_path":     req.file_path,
-        "user_id":       req.user_id,
-        "intent":        intent,
-        "sql":           sql,
+        "question": req.question,
+        "file_path": req.file_path,
+        "user_id": req.user_id,
+        "intent": intent,
+        "sql": sql,
         "generate_chart": req.generate_chart,
-        "sensitive":     guard["sensitive"],
+        "sensitive": guard["sensitive"],
     }
 
     return {
         "query_id": query_id,
-        "intent":   intent,
-        "sql":      sql,
+        "intent": intent,
+        "sql": sql,
         "sensitive": guard["sensitive"],
-        "message":  "SQL generado. Revisá y aprobá para ejecutar.",
+        "message": "SQL generado. Revisá y aprobá para ejecutar.",
         "warnings": schema.get("warnings", []),
     }
 
 
-@app.post("/approve", tags=["Consultas"])
+@app.post("/approve")
 def approve(req: ApproveRequest):
-    """
-    Ejecuta el SQL después de la aprobación explícita del usuario.
-    Human-in-the-loop requerido por el reto.
-    """
     pending = _pending.get(req.query_id)
     if not pending:
         raise HTTPException(404, "Consulta no encontrada o expirada.")
@@ -226,21 +230,20 @@ def approve(req: ApproveRequest):
         )
 
     return {
-        "success":      True,
-        "intent":       pending["intent"],
-        "sql":          result["sql_final"],
-        "data":         df.to_dict(orient="records") if df is not None else [],
-        "explanation":  explanation,
+        "success": True,
+        "intent": pending["intent"],
+        "sql": result["sql_final"],
+        "data": df.to_dict(orient="records") if df is not None else [],
+        "explanation": explanation,
         "autocorrected": result["autocorrected"],
-        "attempts":     result["attempts"],
-        "chart":        chart,
-        "message":      result["user_message"],
+        "attempts": result["attempts"],
+        "chart": chart,
+        "message": result["user_message"],
     }
 
 
-@app.get("/history", tags=["Audit"])
+@app.get("/history")
 def history(limit: int = 50):
-    """Devuelve las últimas entradas del audit log."""
     log_path = Path("logs/audit.jsonl")
     if not log_path.exists():
         return {"events": []}
