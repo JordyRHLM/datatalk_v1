@@ -221,9 +221,17 @@ def approve(req: ApproveRequest):
     chart = None
     if pending["generate_chart"] and df is not None and not df.empty:
         from datatalk.agents import dashboard_agent
-        chart = dashboard_agent.generate_dashboard(
+        dash = dashboard_agent.generate_dashboard(
             df=df, intent=pending["intent"], question=pending["question"]
         )
+        if dash["success"]:
+            chart = {
+                "plotly_json": dash["plotly_json"],
+                "png_base64": dash["png_base64"],
+                "chart_type": dash["chart_type"],
+                # Formato listo para Recharts — el frontend usa esto directamente
+                "recharts": dashboard_agent.to_recharts(dash["plotly_json"], df),
+            }
 
     return {
         "success":      True,
@@ -253,3 +261,16 @@ def history(limit: int = 50):
         except Exception:
             pass
     return {"events": list(reversed(events))}
+
+@app.get("/files", tags=["Datos"])
+def list_files():
+    """Lista los archivos disponibles en uploads/."""
+    files = []
+    for f in UPLOADS_DIR.iterdir():
+        if f.suffix.lower() in {".xlsx", ".xls", ".csv"}:
+            files.append({
+                "name": f.name,
+                "size_kb": round(f.stat().st_size / 1024, 1),
+                "path": str(f),
+            })
+    return {"files": sorted(files, key=lambda x: x["name"])}

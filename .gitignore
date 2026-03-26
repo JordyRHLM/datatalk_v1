@@ -26,6 +26,7 @@ datatalk/data/samples/*.xlsx
 datatalk/data/samples/*.csv
 *.duckdb
 *.db
+~$*
 
 # IDE
 .vscode/settings.json
