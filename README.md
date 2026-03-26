@@ -132,6 +132,6 @@ curl -X POST http://localhost:8000/query/approve \
 
 ---
 
-## Equipo
+## Equipo UmsaBrAInstorm
 
 Microsoft Innovation Challenge 2025
