@@ -17,7 +17,6 @@ from datatalk.agents.prompts import (
     EXPLANATION_USER_TEMPLATE,
 )
 from datatalk.agents import schema_agent, query_agent, dashboard_agent
-from datatalk.agents import history_cache
 from datatalk.core import cache as _cache
 
 load_dotenv()
@@ -41,13 +40,6 @@ def _get_client() -> AzureOpenAI:
 
 
 def classify_intent(question: str) -> str:
-    """
-    Clasifica la pregunta en una de las 5 intenciones analíticas.
-
-    Returns:
-        str: RANKING | TENDENCIA | COMPARATIVA | ANOMALIA | AGREGACION
-    """
-    # ── Cache hit ────────────────────────────────────────────────────────────
     cached_intent = _cache.IntentCache.get(question)
     if cached_intent is not None:
         return cached_intent
@@ -65,14 +57,11 @@ def classify_intent(question: str) -> str:
     intent = (response.choices[0].message.content or "AGREGACION").strip().upper()
     intent = intent if intent in VALID_INTENTS else "AGREGACION"
 
-    # ── Cache set ─────────────────────────────────────────────────────────────
     _cache.IntentCache.set(question, intent)
-
     return intent
 
 
 def _explain_results(question: str, intent: str, df: pd.DataFrame) -> str:
-    """Genera explicación en lenguaje de negocio del resultado."""
     if df is None or df.empty:
         return "No se encontraron datos para esta consulta."
 
@@ -98,58 +87,19 @@ def run(question: str, file_path: str, generate_chart: bool = False, user_id: st
     """
     Flujo completo de DataTalk.
 
-    Args:
-        question: Pregunta del usuario en lenguaje natural
-        file_path: Ruta al archivo de datos (.xlsx o .csv)
-        generate_chart: Si True, genera también el dashboard Plotly
-
     Returns:
         dict con:
           - success (bool)
           - intent (str)
           - sql (str)
           - data (DataFrame | None)
-          - explanation (str)        — resultado en lenguaje de negocio
-          - user_message (str)       — mensaje de estado para la UI
+          - explanation (str)
+          - user_message (str)
           - autocorrected (bool)
           - attempts (int)
-          - chart (dict | None)      — resultado del Dashboard Agent si generate_chart=True
-          - warnings (list)          — advertencias del Schema Agent
+          - chart (dict | None)
+          - warnings (list)
     """
-    # 0. Verificar si es referencia al historial
-    ref = history_cache.resolve_reference(user_id, question)
-    if ref["found"] and ref["entry"]:
-        entry = ref["entry"]
-        import pandas as pd
-        df = pd.DataFrame(entry.get("preview", []))
-        return {
-            "success": True,
-            "intent": entry.get("intent", ""),
-            "sql": entry.get("sql", ""),
-            "data": df if not df.empty else None,
-            "explanation": entry.get("explanation", ""),
-            "user_message": ref["message"],
-            "autocorrected": False,
-            "attempts": 0,
-            "chart": None,
-            "warnings": [],
-            "_from_cache": True,
-        }
-    if not ref["found"] and ref["candidates"]:
-        return {
-            "success": False,
-            "intent": "",
-            "sql": "",
-            "data": None,
-            "explanation": ref["message"],
-            "user_message": ref["message"],
-            "autocorrected": False,
-            "attempts": 0,
-            "chart": None,
-            "warnings": [],
-            "_from_cache": False,
-        }
-
     # 1. Clasificar intención
     intent = classify_intent(question)
 
@@ -201,17 +151,6 @@ def run(question: str, file_path: str, generate_chart: bool = False, user_id: st
             intent=intent,
             question=question,
         )
-
-    # Guardar en caché
-    history_cache.save(user_id, question, {
-        "success": True,
-        "intent": intent,
-        "sql": query_result["sql_final"],
-        "data": df,
-        "explanation": explanation,
-        "autocorrected": query_result["autocorrected"],
-        "attempts": query_result["attempts"],
-    }, file_path)
 
     final_result = {
         "success": True,
