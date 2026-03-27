@@ -1,6 +1,6 @@
 """
 API FastAPI — DataTalk
-Endpoints: /health, /upload, /query, /approve, /history, /audit, /auth, /api/messages (Teams Bot)
+Versión fusionada con caché mejorado y configuración CORS optimizada
 """
 
 import os
@@ -17,13 +17,19 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Bot Framework
 from botbuilder.core import BotFrameworkAdapterSettings, BotFrameworkAdapter, TurnContext
 from botbuilder.schema import Activity
 
 from datatalk.agents import orchestrator, guard_agent, schema_agent, query_agent
-from datatalk.core import cache as _cache
 from datatalk.bot.teams_bot import DataTalkBot
+
+# Importar cache si está disponible (de la segunda versión)
+try:
+    from datatalk.core import cache as _cache
+    CACHE_AVAILABLE = True
+except ImportError:
+    _cache = None
+    CACHE_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -37,23 +43,54 @@ app = FastAPI(
     description="Agente Text-to-SQL con validación y audit log",
 )
 
+# ---------------------------------------------------------------------------
+# CORS — Versión mejorada (combina ambas)
+# ---------------------------------------------------------------------------
+
+def _get_allowed_origins() -> list[str]:
+    raw = os.environ.get("ALLOWED_ORIGINS", "")
+    # Siempre incluir estos en desarrollo
+    origins = [
+        "http://localhost:5173",
+        "http://localhost:3000",
+        "http://localhost:8000",
+        "http://127.0.0.1:5173",
+        "http://127.0.0.1:3000",
+    ]
+    
+    # Si está configurado como "*", devolver lista con "*"
+    if raw and raw.strip() == "*":
+        return ["*"]
+    
+    # Procesar lista de orígenes separados por coma
+    if raw and raw.strip():
+        for o in raw.split(","):
+            o = o.strip()
+            if o and o not in origins:
+                origins.append(o)
+    
+    return origins
+
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=os.environ.get("ALLOWED_ORIGINS", "*").split(","),
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=_get_allowed_origins(),
     allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
+    allow_headers=["*"],
+    expose_headers=["*"],
+    max_age=3600,
 )
 
 # ---------------------------------------------------------------------------
-# Bot Framework Adapter
+# Bot Framework
 # ---------------------------------------------------------------------------
+
 _bot_settings = BotFrameworkAdapterSettings(
     app_id=os.environ.get("MICROSOFT_APP_ID", ""),
     app_password=os.environ.get("MICROSOFT_APP_PASSWORD", ""),
 )
 _bot_settings.channel_auth_tenant = os.environ.get("AZURE_TENANT_ID", "")
-
 _adapter = BotFrameworkAdapter(_bot_settings)
 _bot = DataTalkBot()
 
@@ -74,14 +111,13 @@ from datatalk.api.routes.audit_viewer import router as audit_router
 from datatalk.api.routes.auth import router as auth_router
 
 app.include_router(audit_router, prefix="/audit", tags=["Audit"])
-app.include_router(auth_router, prefix="/auth", tags=["Auth"])
+app.include_router(auth_router,  prefix="/auth",  tags=["Auth"])
 
 # ---------------------------------------------------------------------------
 # Estado en memoria
 # ---------------------------------------------------------------------------
 
 _pending: dict = {}
-
 UPLOADS_DIR = Path("uploads")
 UPLOADS_DIR.mkdir(exist_ok=True)
 
@@ -109,7 +145,24 @@ class ApproveRequest(BaseModel):
 
 @app.get("/health", tags=["Sistema"])
 def health():
-    return {"status": "ok", "service": "DataTalk API", "version": "1.0.0"}
+    """Health check con información del servicio."""
+    health_data = {
+        "status": "ok",
+        "service": "DataTalk API",
+        "version": "1.0.0",
+        "dev_mode": os.environ.get("DEV_MODE", "true"),
+        "cors_origins": _get_allowed_origins(),
+        "cache_available": CACHE_AVAILABLE,
+    }
+    
+    # Agregar stats de cache si está disponible
+    if CACHE_AVAILABLE and _cache:
+        try:
+            health_data["cache_stats"] = _cache.get_stats()
+        except Exception:
+            health_data["cache_stats"] = {"error": "No se pudieron obtener stats"}
+    
+    return health_data
 
 
 @app.post("/api/messages", tags=["Teams Bot"])
@@ -120,7 +173,7 @@ async def messages(request: Request):
     """
     if "application/json" not in request.headers.get("Content-Type", ""):
         raise HTTPException(415, "Unsupported Media Type")
-
+    
     body = await request.json()
     activity = Activity().deserialize(body)
     auth_header = request.headers.get("Authorization", "")
@@ -132,7 +185,7 @@ async def messages(request: Request):
         await _adapter.process_activity(activity, auth_header, aux_func)
     except Exception as e:
         raise HTTPException(500, str(e))
-
+    
     return Response(status_code=200)
 
 
@@ -154,9 +207,13 @@ async def upload(file: UploadFile = File(...), user_id: str = "demo_user"):
     with open(file_path, "wb") as f:
         shutil.copyfileobj(file.file, f)
 
-    # Invalidar cache del archivo si ya existía (nuevo contenido)
-    _cache.SchemaCache.invalidate(str(file_path))
-    _cache.QueryCache.invalidate_file(str(file_path))
+    # Invalidar cache del archivo si ya existía (nuevo contenido) - si cache está disponible
+    if CACHE_AVAILABLE and _cache:
+        try:
+            _cache.SchemaCache.invalidate(str(file_path))
+            _cache.QueryCache.invalidate_file(str(file_path))
+        except Exception as e:
+            logger.warning(f"Cache invalidation falló: {e}")
 
     guard = guard_agent.validate_and_log(
         user_id=user_id, question="upload", file_path=str(file_path), action="upload"
@@ -212,21 +269,21 @@ def query(req: QueryRequest):
 
     query_id = str(uuid.uuid4())
     _pending[query_id] = {
-        "question": req.question,
-        "file_path": req.file_path,
-        "user_id": req.user_id,
-        "intent": intent,
-        "sql": sql,
+        "question":      req.question,
+        "file_path":     req.file_path,
+        "user_id":       req.user_id,
+        "intent":        intent,
+        "sql":           sql,
         "generate_chart": req.generate_chart,
-        "sensitive": guard["sensitive"],
+        "sensitive":     guard["sensitive"],
     }
 
     return {
         "query_id": query_id,
-        "intent": intent,
-        "sql": sql,
+        "intent":   intent,
+        "sql":      sql,
         "sensitive": guard["sensitive"],
-        "message": "SQL generado. Revisá y aprobá para ejecutar.",
+        "message":  "SQL generado. Revisá y aprobá para ejecutar.",
         "warnings": schema.get("warnings", []),
     }
 
@@ -282,22 +339,21 @@ def approve(req: ApproveRequest):
         if dash["success"]:
             chart = {
                 "plotly_json": dash["plotly_json"],
-                "png_base64": dash["png_base64"],
-                "chart_type": dash["chart_type"],
-                # Formato listo para Recharts — el frontend usa esto directamente
-                "recharts": dashboard_agent.to_recharts(dash["plotly_json"], df),
+                "png_base64":  dash["png_base64"],
+                "chart_type":  dash["chart_type"],
+                "recharts":    dashboard_agent.to_recharts(dash["plotly_json"], df),
             }
 
     return {
-        "success": True,
-        "intent": pending["intent"],
-        "sql": result["sql_final"],
-        "data": df.to_dict(orient="records") if df is not None else [],
-        "explanation": explanation,
+        "success":       True,
+        "intent":        pending["intent"],
+        "sql":           result["sql_final"],
+        "data":          df.to_dict(orient="records") if df is not None else [],
+        "explanation":   explanation,
         "autocorrected": result["autocorrected"],
-        "attempts": result["attempts"],
-        "chart": chart,
-        "message": result["user_message"],
+        "attempts":      result["attempts"],
+        "chart":         chart,
+        "message":       result["user_message"],
     }
 
 
@@ -325,17 +381,26 @@ def list_files():
     for f in UPLOADS_DIR.iterdir():
         if f.suffix.lower() in {".xlsx", ".xls", ".csv"}:
             files.append({
-                "name": f.name,
+                "name":    f.name,
                 "size_kb": round(f.stat().st_size / 1024, 1),
-                "path": str(f),
+                "path":    str(f),
             })
     return {"files": sorted(files, key=lambda x: x["name"])}
 
 
+# ---------------------------------------------------------------------------
+# Endpoints de cache (solo si está disponible)
+# ---------------------------------------------------------------------------
+
 @app.get("/cache/stats", tags=["Sistema"])
 def cache_stats():
     """Estado y estadísticas del cache Redis."""
-    return _cache.get_stats()
+    if not CACHE_AVAILABLE or not _cache:
+        raise HTTPException(501, "Cache no disponible en esta instalación")
+    try:
+        return _cache.get_stats()
+    except Exception as e:
+        raise HTTPException(500, f"Error obteniendo stats de cache: {str(e)}")
 
 
 @app.delete("/cache/invalidate", tags=["Sistema"])
@@ -344,15 +409,21 @@ def cache_invalidate(file_path: str = None):
     Invalida el cache de un archivo específico o todo el cache.
     Útil cuando los datos del archivo cambian.
     """
-    if file_path:
-        schemas = 1 if _cache.SchemaCache.invalidate(file_path) else 0
-        queries = _cache.QueryCache.invalidate_file(file_path)
-        return {
-            "invalidated": True,
-            "file_path": file_path,
-            "schemas_removed": schemas,
-            "queries_removed": queries,
-        }
-    # Sin file_path: flush completo (solo dev/admin)
-    removed = _cache.flush_pattern("schema:*") + _cache.flush_pattern("intent:*") + _cache.flush_pattern("query:*")
-    return {"invalidated": True, "keys_removed": removed}
+    if not CACHE_AVAILABLE or not _cache:
+        raise HTTPException(501, "Cache no disponible en esta instalación")
+    
+    try:
+        if file_path:
+            schemas = 1 if _cache.SchemaCache.invalidate(file_path) else 0
+            queries = _cache.QueryCache.invalidate_file(file_path)
+            return {
+                "invalidated": True,
+                "file_path": file_path,
+                "schemas_removed": schemas,
+                "queries_removed": queries,
+            }
+        # Sin file_path: flush completo (solo dev/admin)
+        removed = _cache.flush_pattern("schema:*") + _cache.flush_pattern("intent:*") + _cache.flush_pattern("query:*")
+        return {"invalidated": True, "keys_removed": removed}
+    except Exception as e:
+        raise HTTPException(500, f"Error invalidando cache: {str(e)}")
