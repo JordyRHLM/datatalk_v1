@@ -1,6 +1,6 @@
 """
 API FastAPI — DataTalk
-Endpoints: /health, /upload, /query, /approve, /history, /audit, /auth
+Endpoints: /health, /upload, /query, /approve, /history, /audit, /auth, /api/messages (Teams Bot)
 """
 
 import os
@@ -10,15 +10,20 @@ import logging
 import json
 from pathlib import Path
 
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
 load_dotenv()
 
+# Bot Framework
+from botbuilder.core import BotFrameworkAdapterSettings, BotFrameworkAdapter, TurnContext
+from botbuilder.schema import Activity
+
 from datatalk.agents import orchestrator, guard_agent, schema_agent, query_agent
 from datatalk.core import cache as _cache
+from datatalk.bot.teams_bot import DataTalkBot
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +46,27 @@ app.add_middleware(
 )
 
 # ---------------------------------------------------------------------------
+# Bot Framework Adapter
+# ---------------------------------------------------------------------------
+_bot_settings = BotFrameworkAdapterSettings(
+    app_id=os.environ.get("MICROSOFT_APP_ID", ""),
+    app_password=os.environ.get("MICROSOFT_APP_PASSWORD", ""),
+)
+_bot_settings.channel_auth_tenant = os.environ.get("AZURE_TENANT_ID", "")
+
+_adapter = BotFrameworkAdapter(_bot_settings)
+_bot = DataTalkBot()
+
+
+async def _on_error(context: TurnContext, error: Exception):
+    """Manejador de errores para el bot."""
+    print(f"[Bot Error] {error}")
+    await context.send_activity("⚠️ Ocurrió un error inesperado. Intentá de nuevo.")
+
+
+_adapter.on_turn_error = _on_error
+
+# ---------------------------------------------------------------------------
 # Routers — DESPUÉS de crear app
 # ---------------------------------------------------------------------------
 
@@ -48,7 +74,7 @@ from datatalk.api.routes.audit_viewer import router as audit_router
 from datatalk.api.routes.auth import router as auth_router
 
 app.include_router(audit_router, prefix="/audit", tags=["Audit"])
-app.include_router(auth_router,  prefix="/auth",  tags=["Auth"])
+app.include_router(auth_router, prefix="/auth", tags=["Auth"])
 
 # ---------------------------------------------------------------------------
 # Estado en memoria
@@ -84,6 +110,30 @@ class ApproveRequest(BaseModel):
 @app.get("/health", tags=["Sistema"])
 def health():
     return {"status": "ok", "service": "DataTalk API", "version": "1.0.0"}
+
+
+@app.post("/api/messages", tags=["Teams Bot"])
+async def messages(request: Request):
+    """
+    Endpoint principal del bot de Teams.
+    Bot Framework autentica el request y lo rutea al DataTalkBot.
+    """
+    if "application/json" not in request.headers.get("Content-Type", ""):
+        raise HTTPException(415, "Unsupported Media Type")
+
+    body = await request.json()
+    activity = Activity().deserialize(body)
+    auth_header = request.headers.get("Authorization", "")
+
+    async def aux_func(turn_context: TurnContext):
+        await _bot.on_turn(turn_context)
+
+    try:
+        await _adapter.process_activity(activity, auth_header, aux_func)
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+    return Response(status_code=200)
 
 
 @app.post("/upload", tags=["Datos"])
@@ -162,21 +212,21 @@ def query(req: QueryRequest):
 
     query_id = str(uuid.uuid4())
     _pending[query_id] = {
-        "question":      req.question,
-        "file_path":     req.file_path,
-        "user_id":       req.user_id,
-        "intent":        intent,
-        "sql":           sql,
+        "question": req.question,
+        "file_path": req.file_path,
+        "user_id": req.user_id,
+        "intent": intent,
+        "sql": sql,
         "generate_chart": req.generate_chart,
-        "sensitive":     guard["sensitive"],
+        "sensitive": guard["sensitive"],
     }
 
     return {
         "query_id": query_id,
-        "intent":   intent,
-        "sql":      sql,
+        "intent": intent,
+        "sql": sql,
         "sensitive": guard["sensitive"],
-        "message":  "SQL generado. Revisá y aprobá para ejecutar.",
+        "message": "SQL generado. Revisá y aprobá para ejecutar.",
         "warnings": schema.get("warnings", []),
     }
 
@@ -239,15 +289,15 @@ def approve(req: ApproveRequest):
             }
 
     return {
-        "success":      True,
-        "intent":       pending["intent"],
-        "sql":          result["sql_final"],
-        "data":         df.to_dict(orient="records") if df is not None else [],
-        "explanation":  explanation,
+        "success": True,
+        "intent": pending["intent"],
+        "sql": result["sql_final"],
+        "data": df.to_dict(orient="records") if df is not None else [],
+        "explanation": explanation,
         "autocorrected": result["autocorrected"],
-        "attempts":     result["attempts"],
-        "chart":        chart,
-        "message":      result["user_message"],
+        "attempts": result["attempts"],
+        "chart": chart,
+        "message": result["user_message"],
     }
 
 
@@ -266,6 +316,7 @@ def history(limit: int = 50):
         except Exception:
             pass
     return {"events": list(reversed(events))}
+
 
 @app.get("/files", tags=["Datos"])
 def list_files():
