@@ -260,3 +260,62 @@ def build_teams_card(question: str, sql: str, user_message: str, image_url: str 
     })
 
     return card
+
+def to_recharts(plotly_json: dict, df: pd.DataFrame) -> dict:
+    """
+    Convierte el plotly_json + DataFrame a un formato directo para Recharts.
+    Detecta automáticamente el tipo de chart más adecuado.
+    
+    Returns:
+        dict con: chart_type, data (lista de dicts), keys (x_key, y_keys[]), kpis
+    """
+    if not plotly_json or df is None or df.empty:
+        return {"chart_type": "none", "data": [], "keys": {}, "kpis": []}
+
+    traces = plotly_json.get("traces", [])
+    layout = plotly_json.get("layout", {})
+    chart_type = traces[0].get("type", "bar") if traces else "bar"
+    orientation = traces[0].get("orientation", "v") if traces else "v"
+
+    # Convertir DataFrame a lista de dicts (formato nativo de Recharts)
+    data = df.head(50).to_dict(orient="records")
+
+    # Detectar columnas
+    cols = df.columns.tolist()
+    numeric_cols = df.select_dtypes(include="number").columns.tolist()
+    text_cols = [c for c in cols if c not in numeric_cols]
+
+    x_key = text_cols[0] if text_cols else cols[0]
+    y_keys = numeric_cols[:3]  # máximo 3 métricas
+
+    # Mapear tipo Plotly → tipo Recharts
+    type_map = {
+        "bar": "bar_horizontal" if orientation == "h" else "bar",
+        "scatter": "line",
+        "pie": "pie",
+    }
+    recharts_type = type_map.get(chart_type, "bar")
+
+    # KPIs: si hay una sola columna numérica y pocas filas, mostrar como KPI
+    kpis = []
+    if len(df) == 1 or (len(numeric_cols) >= 1 and len(df) <= 5 and len(text_cols) == 0):
+        for col in numeric_cols[:4]:
+            kpis.append({
+                "label": col.replace("_", " ").title(),
+                "value": df[col].iloc[0] if len(df) == 1 else df[col].sum(),
+            })
+        recharts_type = "kpi"
+
+    title = layout.get("title", {})
+    title_text = title.get("text", "") if isinstance(title, dict) else str(title)
+
+    return {
+        "chart_type": recharts_type,
+        "data": data,
+        "keys": {
+            "x": x_key,
+            "y": y_keys,
+        },
+        "kpis": kpis,
+        "title": title_text,
+    }
