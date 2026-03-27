@@ -17,6 +17,8 @@ from datatalk.agents.prompts import (
     EXPLANATION_USER_TEMPLATE,
 )
 from datatalk.agents import schema_agent, query_agent, dashboard_agent
+from datatalk.agents import history_cache
+from datatalk.core import cache as _cache
 
 load_dotenv()
 
@@ -45,6 +47,11 @@ def classify_intent(question: str) -> str:
     Returns:
         str: RANKING | TENDENCIA | COMPARATIVA | ANOMALIA | AGREGACION
     """
+    # ── Cache hit ────────────────────────────────────────────────────────────
+    cached_intent = _cache.IntentCache.get(question)
+    if cached_intent is not None:
+        return cached_intent
+
     client = _get_client()
     response = client.chat.completions.create(
         model=_DEPLOYMENT,
@@ -56,7 +63,12 @@ def classify_intent(question: str) -> str:
         max_tokens=20,
     )
     intent = (response.choices[0].message.content or "AGREGACION").strip().upper()
-    return intent if intent in VALID_INTENTS else "AGREGACION"
+    intent = intent if intent in VALID_INTENTS else "AGREGACION"
+
+    # ── Cache set ─────────────────────────────────────────────────────────────
+    _cache.IntentCache.set(question, intent)
+
+    return intent
 
 
 def _explain_results(question: str, intent: str, df: pd.DataFrame) -> str:
@@ -82,7 +94,7 @@ def _explain_results(question: str, intent: str, df: pd.DataFrame) -> str:
     return (response.choices[0].message.content or "").strip()
 
 
-def run(question: str, file_path: str, generate_chart: bool = False) -> dict:
+def run(question: str, file_path: str, generate_chart: bool = False, user_id: str = "anon") -> dict:
     """
     Flujo completo de DataTalk.
 
@@ -104,6 +116,40 @@ def run(question: str, file_path: str, generate_chart: bool = False) -> dict:
           - chart (dict | None)      — resultado del Dashboard Agent si generate_chart=True
           - warnings (list)          — advertencias del Schema Agent
     """
+    # 0. Verificar si es referencia al historial
+    ref = history_cache.resolve_reference(user_id, question)
+    if ref["found"] and ref["entry"]:
+        entry = ref["entry"]
+        import pandas as pd
+        df = pd.DataFrame(entry.get("preview", []))
+        return {
+            "success": True,
+            "intent": entry.get("intent", ""),
+            "sql": entry.get("sql", ""),
+            "data": df if not df.empty else None,
+            "explanation": entry.get("explanation", ""),
+            "user_message": ref["message"],
+            "autocorrected": False,
+            "attempts": 0,
+            "chart": None,
+            "warnings": [],
+            "_from_cache": True,
+        }
+    if not ref["found"] and ref["candidates"]:
+        return {
+            "success": False,
+            "intent": "",
+            "sql": "",
+            "data": None,
+            "explanation": ref["message"],
+            "user_message": ref["message"],
+            "autocorrected": False,
+            "attempts": 0,
+            "chart": None,
+            "warnings": [],
+            "_from_cache": False,
+        }
+
     # 1. Clasificar intención
     intent = classify_intent(question)
 
@@ -113,6 +159,13 @@ def run(question: str, file_path: str, generate_chart: bool = False) -> dict:
     # 3. Detectar si pide gráfico
     chart_keywords = ["dashboard", "gráfico", "grafico", "chart", "visual", "mostrar", "graficá", "graficame"]
     wants_chart = generate_chart or any(k in question.lower() for k in chart_keywords)
+
+    # ── Query cache hit ───────────────────────────────────────────────────────
+    cached_query = _cache.QueryCache.get(file_path, question, intent)
+    if cached_query is not None and not wants_chart:
+        cached_query["_from_cache"] = True
+        cached_query["warnings"] = schema.get("warnings", [])
+        return cached_query
 
     # 4. Ejecutar Query Agent con validation loop
     query_result = query_agent.run_with_validation(
@@ -149,7 +202,18 @@ def run(question: str, file_path: str, generate_chart: bool = False) -> dict:
             question=question,
         )
 
-    return {
+    # Guardar en caché
+    history_cache.save(user_id, question, {
+        "success": True,
+        "intent": intent,
+        "sql": query_result["sql_final"],
+        "data": df,
+        "explanation": explanation,
+        "autocorrected": query_result["autocorrected"],
+        "attempts": query_result["attempts"],
+    }, file_path)
+
+    final_result = {
         "success": True,
         "intent": intent,
         "sql": query_result["sql_final"],
@@ -160,4 +224,11 @@ def run(question: str, file_path: str, generate_chart: bool = False) -> dict:
         "attempts": query_result["attempts"],
         "chart": chart,
         "warnings": schema["warnings"],
+        "_from_cache": False,
     }
+
+    # ── Query cache set ───────────────────────────────────────────────────────
+    if not wants_chart:
+        _cache.QueryCache.set(file_path, question, intent, final_result)
+
+    return final_result

@@ -7,8 +7,6 @@ Permite hacer preguntas en lenguaje natural sobre los 3 archivos de datos.
 
 import sys
 import os
-import textwrap
-import base64
 from pathlib import Path
 
 # Asegurar que Python encuentra el paquete datatalk
@@ -25,7 +23,6 @@ ARCHIVOS = {
     "2": ("logistica_entregas.xlsx", "Logística — demoras por zona"),
     "3": ("rrhh_asistencia.xlsx",    "RRHH — ausentismo por área (SENSIBLE)"),
 }
-
 
 def seleccionar_archivo() -> str:
     print("\n╔══════════════════════════════════════════════╗")
@@ -51,110 +48,100 @@ def seleccionar_archivo() -> str:
 
 
 def mostrar_resultado(result: dict):
-    LINE = "─" * 52
+    print("\n" + "─" * 50)
 
-    # ── Encabezado ──────────────────────────────────────
-    print(f"\n{LINE}")
-    intent = result.get("intent", "—")
-    intentos = result.get("attempts", "—")
-    autocorr = "  ⚡ Autocorregido" if result.get("autocorrected") else ""
-    print(f"  Intención : {intent}   |   Intentos : {intentos}{autocorr}")
+    # Intent
+    print(f"  Intención detectada : {result.get('intent', '—')}")
+    print(f"  Intentos usados     : {result.get('attempts', '—')}")
 
-    # Advertencias del schema
-    for w in result.get("warnings", []):
-        print(f"  ⚠  {w}")
+    if result.get("_from_cache"):
+        print("  📂 Resultado del historial")
+    if result.get("autocorrected"):
+        print("  ⚡ Autocorregido automáticamente")
 
-    # ── SQL generado ─────────────────────────────────────
-    sql = result.get("sql", "").strip()
+    if result.get("warnings"):
+        for w in result["warnings"]:
+            print(f"  ⚠ {w}")
+
+    # SQL
+    sql = result.get("sql", "")
     if sql:
         print(f"\n  SQL generado:")
-        print(f"  {'─'*46}")
-        for line in sql.splitlines():
+        for line in sql.strip().splitlines():
             print(f"    {line}")
-        print(f"  {'─'*46}")
 
-    # ── Error ────────────────────────────────────────────
+    print("─" * 50)
+
+    # Resultado
     if not result.get("success"):
         print(f"\n  ✗ {result.get('explanation') or result.get('user_message')}")
-        print(LINE)
         return
 
-    # ── Tabla de resultados (máx 10 filas) ───────────────
     df = result.get("data")
     if df is not None and not df.empty:
-        total = len(df)
-        df_show = df.head(10)
-
-        print(f"\n  Resultados — {total} fila{'s' if total != 1 else ''} totales"
-              + (f" (mostrando primeras 10)" if total > 10 else "") + ":\n")
-
-        # Calcular anchos de columna
-        col_widths = {}
-        for col in df_show.columns:
-            max_data = df_show[col].astype(str).str.len().max()
-            col_widths[col] = max(len(str(col)), max_data, 6)
-
-        # Encabezado de tabla
-        header = "  " + "  ".join(str(col).ljust(col_widths[col]) for col in df_show.columns)
-        sep    = "  " + "  ".join("─" * col_widths[col] for col in df_show.columns)
+        print(f"\n  Resultado ({len(df)} filas):")
+        print()
+        # Formatear tabla simple
+        col_widths = {col: max(len(str(col)), df[col].astype(str).str.len().max()) for col in df.columns}
+        header = "  " + "  ".join(str(col).ljust(col_widths[col]) for col in df.columns)
         print(header)
-        print(sep)
-
-        # Filas
-        for _, row in df_show.iterrows():
-            print("  " + "  ".join(str(row[col]).ljust(col_widths[col]) for col in df_show.columns))
-
-        if total > 10:
-            print(f"\n  ... y {total - 10} filas más")
+        print("  " + "-" * (sum(col_widths.values()) + 2 * len(df.columns)))
+        for _, row in df.iterrows():
+            print("  " + "  ".join(str(row[col]).ljust(col_widths[col]) for col in df.columns))
     else:
         print("\n  Sin resultados para esta consulta.")
 
-    # ── Conclusión de negocio ────────────────────────────
+    # Explicación
     explanation = result.get("explanation", "").strip()
     if explanation:
-        print(f"\n{LINE}")
-        print(f"  💡 Conclusión de negocio:\n")
-        for line in textwrap.wrap(explanation, width=56):
-            print(f"     {line}")
+        print(f"\n  Conclusión:")
+        # Wrap a 60 chars
+        words = explanation.split()
+        line = "  "
+        for word in words:
+            if len(line) + len(word) > 62:
+                print(line)
+                line = "  " + word + " "
+            else:
+                line += word + " "
+        if line.strip():
+            print(line)
 
-    # ── Gráfico ──────────────────────────────────────────
+    # Dashboard
     chart = result.get("chart")
     if chart and chart.get("success"):
-        chart_type = chart.get("chart_type", "bar")
-        print(f"\n  📊 Gráfico generado: {chart_type}")
+        print(f"\n  Gráfico generado: {chart.get('chart_type', 'bar')}")
         if chart.get("png_base64"):
+            # Guardar PNG para ver
+            import base64
             png_path = Path(__file__).parent / "chart_resultado.png"
             with open(png_path, "wb") as f:
                 f.write(base64.b64decode(chart["png_base64"]))
-            print(f"  PNG guardado → {png_path.name}")
-            print(f"  Abrilo con : start {png_path.name}")
-
-    print(f"{LINE}\n")
+            print(f"  PNG guardado en: {png_path.name}")
+            print(f"  Abrilo con: start {png_path.name}")
 
 
 def main():
     file_path = seleccionar_archivo()
 
-    print("\n" + "═" * 52)
+    print("\n" + "═" * 50)
     print("  Escribí tu pregunta en español.")
     print("  Comandos: 'cambiar' (otro archivo) | 'salir'")
-    print("  Tip: agregá 'gráfico' para generar un chart.")
-    print("═" * 52)
+    print("═" * 50)
 
+    # Preguntas de ejemplo según el archivo
     nombre_archivo = Path(file_path).name
     if "ventas" in nombre_archivo:
         ejemplos = [
             "¿Cuáles son las 3 categorías con más ventas?",
             "¿Cómo evolucionaron las ventas mes a mes?",
             "¿Por qué cayeron las ventas de Lácteos?",
-            "Mostrame un gráfico de ventas por zona",
         ]
     elif "logistica" in nombre_archivo:
         ejemplos = [
             "¿Qué zona tiene más demoras?",
             "Comparar el porcentaje de demoras entre zona Norte y el resto",
             "¿Cuántos pedidos hay por transportista?",
-            "Mostrame un gráfico de demoras por zona",
         ]
     else:
         ejemplos = [
@@ -186,22 +173,26 @@ def main():
             file_path = seleccionar_archivo()
             continue
 
+        # Detectar si pide gráfico
         pide_grafico = any(k in pregunta.lower() for k in
                            ["grafico", "gráfico", "dashboard", "chart", "visual", "graficame"])
 
-        print("\n  ⏳ Procesando...", end="", flush=True)
+        print("\n  Procesando...", end="", flush=True)
 
         try:
             result = orchestrator.run(
                 question=pregunta,
                 file_path=file_path,
                 generate_chart=pide_grafico,
+                user_id="demo_user",
             )
-            print(" listo.\n")
+            print(" listo.")
             mostrar_resultado(result)
         except Exception as e:
-            print(f"\n  ❌ Error: {e}")
-            print("  Verificá que el .env tiene las credenciales de Azure OpenAI.\n")
+            print(f"\n  Error: {e}")
+            print("  Verificá que el .env tiene las credenciales de Azure OpenAI.")
+
+        print()
 
 
 if __name__ == "__main__":
