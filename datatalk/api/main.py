@@ -22,6 +22,7 @@ from botbuilder.core import BotFrameworkAdapterSettings, BotFrameworkAdapter, Tu
 from botbuilder.schema import Activity
 
 from datatalk.agents import orchestrator, guard_agent, schema_agent, query_agent
+from datatalk.core import cache as _cache
 from datatalk.bot.teams_bot import DataTalkBot
 
 logger = logging.getLogger(__name__)
@@ -152,6 +153,10 @@ async def upload(file: UploadFile = File(...), user_id: str = "demo_user"):
     file_path = UPLOADS_DIR / file.filename
     with open(file_path, "wb") as f:
         shutil.copyfileobj(file.file, f)
+
+    # Invalidar cache del archivo si ya existía (nuevo contenido)
+    _cache.SchemaCache.invalidate(str(file_path))
+    _cache.QueryCache.invalidate_file(str(file_path))
 
     guard = guard_agent.validate_and_log(
         user_id=user_id, question="upload", file_path=str(file_path), action="upload"
@@ -325,3 +330,29 @@ def list_files():
                 "path": str(f),
             })
     return {"files": sorted(files, key=lambda x: x["name"])}
+
+
+@app.get("/cache/stats", tags=["Sistema"])
+def cache_stats():
+    """Estado y estadísticas del cache Redis."""
+    return _cache.get_stats()
+
+
+@app.delete("/cache/invalidate", tags=["Sistema"])
+def cache_invalidate(file_path: str = None):
+    """
+    Invalida el cache de un archivo específico o todo el cache.
+    Útil cuando los datos del archivo cambian.
+    """
+    if file_path:
+        schemas = 1 if _cache.SchemaCache.invalidate(file_path) else 0
+        queries = _cache.QueryCache.invalidate_file(file_path)
+        return {
+            "invalidated": True,
+            "file_path": file_path,
+            "schemas_removed": schemas,
+            "queries_removed": queries,
+        }
+    # Sin file_path: flush completo (solo dev/admin)
+    removed = _cache.flush_pattern("schema:*") + _cache.flush_pattern("intent:*") + _cache.flush_pattern("query:*")
+    return {"invalidated": True, "keys_removed": removed}

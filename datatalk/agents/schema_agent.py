@@ -9,6 +9,8 @@ import duckdb
 import pandas as pd
 from pathlib import Path
 
+from datatalk.core import cache as _cache
+
 
 # Tipos DuckDB → categoría legible para el prompt
 _TYPE_MAP = {
@@ -79,6 +81,12 @@ def run(file_path: str) -> dict:
 
     if not path.exists():
         raise FileNotFoundError(f"Archivo no encontrado: {file_path}")
+
+    # ── Cache hit ────────────────────────────────────────────────────────────
+    cached = _cache.SchemaCache.get(str(path.resolve()))
+    if cached is not None:
+        cached["_from_cache"] = True
+        return cached
 
     suffix = path.suffix.lower()
     if suffix not in (".xlsx", ".xls", ".csv", ".tsv"):
@@ -160,14 +168,20 @@ def run(file_path: str) -> dict:
 
     con.close()
 
-    return {
+    result = {
         "table_name": table_name,
         "file_path": str(path.resolve()),
         "row_count": row_count,
         "columns": columns,
         "warnings": warnings,
         "sql_ready": True,
+        "_from_cache": False,
     }
+
+    # ── Cache set ─────────────────────────────────────────────────────────────
+    _cache.SchemaCache.set(str(path.resolve()), result)
+
+    return result
 
 
 def schema_to_prompt_text(schema: dict) -> str:
